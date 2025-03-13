@@ -1,0 +1,583 @@
+//+------------------------------------------------------------------+
+//|                                                     MyEA.mq5     |
+//|           استراتيجية الأوامر المعلقة وإدارة المخاطر مع           |
+//|                وقف الخسارة المتحرك المُحسن                        |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+#property copyright "YourName"
+#property version   "1.00"
+#property strict
+
+//--------------------------------------------------------------
+
+// المدخلات الرئيسية
+input double   Lot1          = 0.01;    // حجم اللوت للصفقة الأولى
+input double   Multiplier    = 1.2;    // المضاعف للصفقة اللاحقة
+input int      TakeProfitPips= 20000;     // عدد نقاط جني الربح
+input int      StopLossPips  = 40000;     // عدد نقاط وقف الخسارة
+input string   CommentEA     = "HedgingStrategyEA";  // تعليق على الصفقات
+
+string Main = "Main";
+// متغيرات داخلية
+enum TradeStep { STEP_NONE = 0, STEP_BUY, STEP_SELL };
+int      currentStep   = STEP_NONE;  // الخطوة الحالية
+double   currentLot    = 0.0;        // حجم اللوت الحال
+
+//---------------------------------------------------------------
+
+// مدخلات الحساب والاستراتيجية
+input double   LotSize                   = 0.01;           // حجم اللوت الثابت
+input bool     UseCapitalBasedLotSizing  = false;          // تفعيل حساب حجم اللوت بناءً على الرصيد
+input double   LotPer100                 = 0.01;          // حجم اللوت لكل 100 دولار من الرصيد
+input int      MagicNumber               = 123456;        // رقم تعريف الصفقة
+
+// إعدادات التريلينج ستوب والسبريد
+input double   TrailingProfitThreshold   = 200;           // الحد الأدنى للأرباح (بالنقاط) لتفعيل التريلينج ستوب
+input double   TrailingStopOffset        = 100;            // المسافة (بالنقاط) التي يُبعد بها وقف الخسارة عن السعر الحالي عند التريلينج
+input double   MaxSpread                 = 180;           // أقصى سبريد مسموح
+input double   PendingActivationThreshold= 180;           // عتبة تفعيل الأمر المعلق
+
+// إعدادات الحساب
+input long     AllowedAccount            = 0;             // رقم الحساب المسموح (0 يعني جميع الحسابات)
+input string   ExpirationDateStr         = "2026.03.01 23:59:59";  // تاريخ انتهاء صلاحية الـ EA
+
+// إعدادات جلسات التداول
+input bool     TradeSydney               = true;
+input int      SydneyStartHour           = 22;
+input int      SydneyStartMinute         = 0;
+input int      SydneyEndHour             = 7;
+input int      SydneyEndMinute           = 0;
+input bool     TradeTokyo                = true;
+input int      TokyoStartHour            = 0;
+input int      TokyoStartMinute          = 0;
+input int      TokyoEndHour              = 9;
+input int      TokyoEndMinute            = 0;
+input bool     TradeLondon               = true;
+input int      LondonStartHour           = 8;
+input int      LondonStartMinute         = 0;
+input int      LondonEndHour             = 17;
+input int      LondonEndMinute           = 0;
+input bool     TradeNewYork              = true;
+input int      NewYorkStartHour          = 13;
+input int      NewYorkStartMinute        = 0;
+input int      NewYorkEndHour            = 22;
+input int      NewYorkEndMinute          = 0;
+
+// المتغيرات العامة
+datetime       lastOrderCandleTime       = 0;
+long           pendingTicket             = -1;
+
+//+------------------------------------------------------------------+
+//| دالة التحقق من الجلسات                                           |
+//+------------------------------------------------------------------+
+bool CheckSession(int startHour, int startMinute, int endHour, int endMinute)
+  {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentMinutes = dt.hour * 60 + dt.min;
+   int startMinutes   = startHour * 60 + startMinute;
+   int endMinutes     = endHour * 60 + endMinute;
+
+   if(startMinutes < endMinutes)
+      return (currentMinutes >= startMinutes && currentMinutes < endMinutes);
+   else
+      return (currentMinutes >= startMinutes || currentMinutes < endMinutes);
+  }
+
+//+------------------------------------------------------------------+
+//| دالة وقت التداول                                                 |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+  {
+   if(TradeSydney && CheckSession(SydneyStartHour, SydneyStartMinute, SydneyEndHour, SydneyEndMinute))
+      return true;
+   if(TradeTokyo && CheckSession(TokyoStartHour, TokyoStartMinute, TokyoEndHour, TokyoEndMinute))
+      return true;
+   if(TradeLondon && CheckSession(LondonStartHour, LondonStartMinute, LondonEndHour, LondonEndMinute))
+      return true;
+   if(TradeNewYork && CheckSession(NewYorkStartHour, NewYorkStartMinute, NewYorkEndHour, NewYorkEndMinute))
+      return true;
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| دالة التهيئة                                                            |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+
+   currentStep   = STEP_NONE;
+   currentLot    = Lot1;
+
+   Print("EA Initialized: Hedging Strategy Started.");
+   return(INIT_SUCCEEDED);
+
+//---------------------------------------------------------------------
+
+   if(AllowedAccount != 0 && AccountInfoInteger(ACCOUNT_LOGIN) != AllowedAccount)
+     {
+      Print("الحساب الحالي غير مسموح لتشغيل هذا الـ EA.");
+      return(INIT_FAILED);
+     }
+
+   datetime expiration = StringToTime(ExpirationDateStr);
+   if(TimeCurrent() > expiration)
+     {
+      Print("انتهت صلاحية تشغيل الـ EA.");
+      return(INIT_FAILED);
+     }
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| تحويل النقاط إلى نقاط كاملة                                     |
+//+------------------------------------------------------------------+
+double PointsToPips(double points)
+  {
+   return points / 10.0;
+  }
+
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| فحص الصفقات المفتوحة                                            |
+//+------------------------------------------------------------------+
+double GetLastEntryPrice()
+  {
+   int totalPositions = PositionsTotal();
+   if(totalPositions > 0)
+     {
+      // الحصول على رقم التذكرة للصفقة الأخيرة (آخر مؤشر)
+      ulong lastTicket = PositionGetTicket(totalPositions - 1);
+      if(PositionSelectByTicket(lastTicket))
+        {
+         // إعادة سعر الدخول للصفقة المحددة
+         return PositionGetDouble(POSITION_PRICE_OPEN);
+        }
+     }
+// في حال عدم وجود صفقات مفتوحة أو فشل عملية التحديد
+   return -1;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void CheckPositions()
+  {
+   if(PositionsTotal() > 0)
+     {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket))
+           {
+
+            double entryPrice = GetLastEntryPrice();
+            //double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double currentPrice = (currentStep == STEP_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                  : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double priceDiff = MathAbs(currentPrice - entryPrice);
+
+            if(priceDiff >= TakeProfitPips * _Point)
+              {
+               // إذا انعكس السعر بمقدار الهدف، نفتح صفقة معاكسة بمضاعفة اللوت
+               currentLot *= Multiplier;
+               if(currentStep == STEP_BUY)
+                 {
+                  OpenSellOrder(currentLot);
+                  currentStep = STEP_SELL;
+                 }
+               else
+                  if(currentStep == STEP_SELL)
+                    {
+                     OpenBuyOrder(currentLot);
+                     currentStep = STEP_BUY;
+                    }
+              }
+           }
+
+        }
+     }
+
+  }
+
+//+------------------------------------------------------------------+
+//| دالة فتح صفقة شراء                                               |
+//+------------------------------------------------------------------+
+bool OpenBuyOrder(double lots)
+  {
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double sl    = NormalizeDouble(price - (StopLossPips * _Point), _Digits);
+   double tp    = NormalizeDouble(price + (TakeProfitPips * _Point), _Digits);
+
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = _Symbol;
+   request.volume       = lots;
+   request.type         = ORDER_TYPE_BUY;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = 10;
+   request.comment      = CommentEA;
+   request.type_filling = ORDER_FILLING_FOK;
+   request.type_time    = ORDER_TIME_GTC;
+
+   if(!OrderSend(request, result))
+     {
+      Print("Buy OrderSend failed. Code=", GetLastError());
+      return false;
+     }
+
+   if(result.retcode == 10009)
+     {
+      Print("Buy Order Placed Successfully. Ticket=", result.order);
+      return true;
+     }
+   else
+     {
+      Print("Buy OrderSend retcode=", result.retcode);
+      return false;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| دالة فتح صفقة بيع                                                |
+//+------------------------------------------------------------------+
+bool OpenSellOrder(double lots)
+  {
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl    = NormalizeDouble(price + (StopLossPips * _Point), _Digits);
+   double tp    = NormalizeDouble(price - (TakeProfitPips * _Point), _Digits);
+
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = _Symbol;
+   request.volume       = lots;
+   request.type         = ORDER_TYPE_SELL;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = 10;
+   request.comment      = CommentEA;
+   request.type_filling = ORDER_FILLING_FOK;
+   request.type_time    = ORDER_TIME_GTC;
+
+   if(!OrderSend(request, result))
+     {
+      Print("Sell OrderSend failed. Code=", GetLastError());
+      return false;
+     }
+
+   if(result.retcode == 10009)
+     {
+      Print("Sell Order Placed Successfully. Ticket=", result.order);
+      return true;
+     }
+   else
+     {
+      Print("Sell OrderSend retcode=", result.retcode);
+      return false;
+     }
+  }
+//+------------------------------------------------------------------+
+
+
+//+------------------------------------------------------------------+
+//| دالة التعامل مع التيك                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+
+
+
+   if(!IsTradingTime())
+      return;
+
+   bool openPositionExists = false;
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+     {
+      ulong posTicket = PositionGetTicket(i);
+      if(PositionSelectByTicket(posTicket))
+        {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            StringCompare(PositionGetString(POSITION_SYMBOL), _Symbol) == 0)
+           {
+            openPositionExists = true;
+            break;
+           }
+        }
+     }
+
+   if(!openPositionExists)
+     {
+      datetime prevCandleTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+      double prevOpen  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+      double prevClose = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+      if(lastOrderCandleTime == prevCandleTime)
+         return;
+      else
+         if(TimeCurrent() < prevCandleTime + 60)
+            return;
+         else
+           {
+            int totalOrders = OrdersTotal();
+            for(int i = totalOrders - 1; i >= 0; i--)
+              {
+               ulong order_ticket = OrderGetTicket(i);
+               if(OrderSelect(order_ticket))
+                 {
+                  if(OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
+                     StringCompare(OrderGetString(ORDER_SYMBOL), _Symbol) == 0)
+                    {
+                     int order_type = (int)OrderGetInteger(ORDER_TYPE);
+                     if(order_type == ORDER_TYPE_BUY_STOP || order_type == ORDER_TYPE_SELL_STOP)
+                       {
+                        trade.OrderDelete(order_ticket);
+                       }
+                    }
+                 }
+              }
+            pendingTicket = -1;
+
+            int orderType = -1;
+            if(prevClose > prevOpen)
+               orderType = ORDER_TYPE_BUY_STOP;
+            else
+               if(prevClose < prevOpen)
+                  orderType = ORDER_TYPE_SELL_STOP;
+               else
+                  orderType = -1;
+
+            if(orderType != -1)
+              {
+               int sar_handle = iSAR(_Symbol, PERIOD_CURRENT, 0.4, 0.4);
+               if(sar_handle == INVALID_HANDLE)
+                 {
+                  Print("فشل إنشاء مؤشر SAR");
+                  return;
+                 }
+               double sarBuffer[];
+               if(CopyBuffer(sar_handle, 0, 1, 1, sarBuffer) <= 0)
+                 {
+                  Print("فشل نسخ بيانات SAR");
+                  IndicatorRelease(sar_handle);
+                  return;
+                 }
+               double sarValue = sarBuffer[0];
+               IndicatorRelease(sar_handle);
+
+               if(orderType == ORDER_TYPE_BUY_STOP)
+                 {
+                  double prevLow = iLow(_Symbol, PERIOD_CURRENT, 1);
+                  if(sarValue >= prevLow)
+                     return;
+                 }
+               else
+                  if(orderType == ORDER_TYPE_SELL_STOP)
+                    {
+                     double prevHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+                     if(sarValue <= prevHigh)
+                        return;
+                    }
+              }
+
+            if(orderType != -1)
+              {
+               double price = 0.0;
+               if(orderType == ORDER_TYPE_BUY_STOP)
+                  price = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + 10 * _Point;
+               else
+                  if(orderType == ORDER_TYPE_SELL_STOP)
+                     price = SymbolInfoDouble(_Symbol, SYMBOL_BID) - 10 * _Point;
+
+               double computedVolume = UseCapitalBasedLotSizing ? (AccountInfoDouble(ACCOUNT_BALANCE) / 100.0) * LotPer100 : LotSize;
+               double volMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+               double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+               if(computedVolume < volMin)
+                  computedVolume = volMin;
+               else
+                  computedVolume = MathFloor(computedVolume / volStep) * volStep;
+
+               MqlTradeRequest request;
+               MqlTradeResult  result;
+               ZeroMemory(request);
+               ZeroMemory(result);
+
+               request.action         = TRADE_ACTION_PENDING;
+               request.symbol         = _Symbol;
+               request.volume         = computedVolume;
+               request.magic          = MagicNumber;
+               request.price          = price;
+               request.sl             = 0.0; // تم تعطيل وقف الخسارة العادي
+               request.tp             = 0;
+               request.deviation      = 10;
+               request.comment        = Main;
+               request.type           = orderType;
+               request.type_filling   = ORDER_FILLING_FOK;
+               request.type_time      = ORDER_TIME_GTC;
+
+               if(!trade.OrderSend(request, result))
+                 {
+                  Print("فشل إرسال الأمر المعلق: ", result.comment);
+                 }
+               else
+                 {
+                  pendingTicket = (long)result.order;
+                  lastOrderCandleTime = prevCandleTime;
+
+                  double currentPrice = (orderType == ORDER_TYPE_BUY_STOP) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+                  double spreadPoints = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+                  if(spreadPoints > MaxSpread && MathAbs(price - currentPrice) < PendingActivationThreshold * _Point)
+                    {
+                     trade.OrderDelete((ulong)pendingTicket);
+                     pendingTicket = -2;
+                     Print("تم إلغاء الأمر المعلق بسبب ارتفاع السبريد.");
+                    }
+                 }
+              }
+           }
+     }
+
+// جزء التريلينج ستوب
+   totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+     {
+      ulong posTicket = PositionGetTicket(i);
+      if(PositionSelectByTicket(posTicket))
+        {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            StringCompare(PositionGetString(POSITION_SYMBOL), _Symbol)==0)
+           {
+            double posPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
+            double currentSL  = PositionGetDouble(POSITION_SL);
+            ulong ticket      = PositionGetInteger(POSITION_TICKET);
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+            if(posType == POSITION_TYPE_BUY)
+              {
+               double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+               double profitPips = PointsToPips((currentBid - posPrice) / _Point);
+               if(profitPips >= TrailingProfitThreshold)
+                 {
+                  double newSL = currentBid - (TrailingStopOffset * 10 * _Point);
+                  newSL = NormalizeDouble(newSL, _Digits);
+                  newSL = MathMax(newSL, posPrice);
+
+                  double minDistance = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+                  if((currentBid - newSL) < minDistance)
+                     newSL = currentBid - minDistance;
+
+                  if(newSL > currentSL || currentSL == 0)
+                     trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+                 }
+              }
+            else
+               if(posType == POSITION_TYPE_SELL)
+                 {
+                  double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                  double profitPips = PointsToPips((posPrice - currentAsk) / _Point);
+                  if(profitPips >= TrailingProfitThreshold)
+                    {
+                     double newSL = currentAsk + (TrailingStopOffset * 10 * _Point);
+                     newSL = NormalizeDouble(newSL, _Digits);
+                     newSL = MathMin(newSL, posPrice);
+
+                     double minDistance = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+                     if((newSL - currentAsk) < minDistance)
+                        newSL = currentAsk + minDistance;
+
+                     if((newSL < currentSL || currentSL == 0) && newSL != 0)
+                        trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+                    }
+                 }
+           }
+        }
+     }
+
+
+
+
+   if(PositionsTotal() > 0)
+     {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket))
+           {
+            string cmt_main = PositionGetString(POSITION_COMMENT);
+            if(cmt_main == Main)
+              {
+               ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+               if(posType == POSITION_TYPE_BUY)
+                 {
+                  currentStep = STEP_BUY;
+                 }
+               else
+                  if(posType == POSITION_TYPE_SELL)
+                    {
+                     currentStep = STEP_SELL;
+                    }
+              }
+           }
+        }
+     }
+
+   CheckPositions();
+
+
+   if(PositionsTotal() == 2)
+     {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket))
+           {
+            string cmt_main = PositionGetString(POSITION_COMMENT);
+            if(cmt_main == Main)
+              {
+               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               double stopLoss = StopLossPips;
+               double takeProfit = TakeProfitPips;
+               double newSL,newTP;
+               if(posType == POSITION_TYPE_BUY)
+                 {
+                  stopLoss = newSL > 0 ? newSL : 0;
+                  takeProfit = newTP > 0 ? newTP : 0;
+                 }
+               else
+                  if(posType == POSITION_TYPE_SELL)
+                    {
+                     stopLoss = newSL > 0 ? newSL : 0;
+                     takeProfit = newTP > 0 ? newTP : 0;
+                    }
+
+              }
+           }
+        }
+     }
+
+
+
+  }
+//+------------------------------------------------------------------+
