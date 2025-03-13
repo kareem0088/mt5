@@ -7,10 +7,10 @@
 #property strict
 
 // المدخلات الرئيسية
-input double   Lot1          = 0.1;    // حجم اللوت للصفقة الأولى
-input double   Multiplier    = 2.0;    // المضاعف للصفقة اللاحقة
-input int      TakeProfitPips= 30;     // عدد نقاط جني الربح
-input int      StopLossPips  = 60;     // عدد نقاط وقف الخسارة
+input double   Lot1          = 0.01;    // حجم اللوت للصفقة الأولى
+input double   Multiplier    = 1.2;    // المضاعف للصفقة اللاحقة
+input int      TakeProfitPips= 20000;     // عدد نقاط جني الربح
+input int      StopLossPips  = 40000;     // عدد نقاط وقف الخسارة
 input string   CommentEA     = "HedgingStrategyEA";  // تعليق على الصفقات
 
 // متغيرات داخلية
