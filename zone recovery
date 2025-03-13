@@ -1,0 +1,201 @@
+//+------------------------------------------------------------------+
+//|  Simple Hedge Martingale EA                                     |
+//|  استراتيجية المضاعفات العكسية (Hedging Martingale)             |
+//+------------------------------------------------------------------+
+#property copyright "YourName"
+#property version   "1.00"
+#property strict
+
+// المدخلات الرئيسية
+input double   Lot1          = 0.1;    // حجم اللوت للصفقة الأولى
+input double   Multiplier    = 2.0;    // المضاعف للصفقة اللاحقة
+input int      TakeProfitPips= 30;     // عدد نقاط جني الربح
+input int      StopLossPips  = 60;     // عدد نقاط وقف الخسارة
+input string   CommentEA     = "HedgingStrategyEA";  // تعليق على الصفقات
+
+// متغيرات داخلية
+enum TradeStep { STEP_NONE = 0, STEP_BUY, STEP_SELL };
+int      currentStep   = STEP_NONE;  // الخطوة الحالية
+double   currentLot    = 0.0;        // حجم اللوت الحالي
+
+//+------------------------------------------------------------------+
+//| expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   currentStep   = STEP_NONE;
+   currentLot    = Lot1;
+
+   Print("EA Initialized: Hedging Strategy Started.");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   CheckPositions();
+
+   if(currentStep == STEP_NONE && PositionsTotal() == 0)
+   {
+      OpenBuyOrder(currentLot);
+      currentStep = STEP_BUY;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| فحص الصفقات المفتوحة                                            |
+//+------------------------------------------------------------------+
+double GetLastEntryPrice()
+{
+   int totalPositions = PositionsTotal();
+   if(totalPositions > 0)
+   {
+      // الحصول على رقم التذكرة للصفقة الأخيرة (آخر مؤشر)
+      ulong lastTicket = PositionGetTicket(totalPositions - 1);
+      if(PositionSelectByTicket(lastTicket))
+      {
+         // إعادة سعر الدخول للصفقة المحددة
+         return PositionGetDouble(POSITION_PRICE_OPEN);
+      }
+   }
+   // في حال عدم وجود صفقات مفتوحة أو فشل عملية التحديد
+   return -1;
+}
+
+void CheckPositions()
+{
+   if (PositionsTotal() > 0)
+   {
+      for (int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if (PositionSelectByTicket(ticket))
+         {
+            string cmt = PositionGetString(POSITION_COMMENT);
+            if (cmt == CommentEA)
+            {
+               double entryPrice = GetLastEntryPrice();
+               //double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               double currentPrice = (currentStep == STEP_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) 
+                                                                : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+               double priceDiff = MathAbs(currentPrice - entryPrice);
+
+               if (priceDiff >= TakeProfitPips * _Point)
+               {
+                  // إذا انعكس السعر بمقدار الهدف، نفتح صفقة معاكسة بمضاعفة اللوت
+                  currentLot *= Multiplier; 
+                  if (currentStep == STEP_BUY)
+                  {
+                     OpenSellOrder(currentLot);
+                     currentStep = STEP_SELL;
+                  }
+                  else if (currentStep == STEP_SELL)
+                  {
+                     OpenBuyOrder(currentLot);
+                     currentStep = STEP_BUY;
+                  }
+               }
+            }
+         }
+      }
+   }
+   else
+   {
+      // في حال لم تكن هناك صفقات، نبدأ من جديد بصفقة شراء
+      currentLot = Lot1;
+      OpenBuyOrder(currentLot);
+      currentStep = STEP_BUY;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| دالة فتح صفقة شراء                                               |
+//+------------------------------------------------------------------+
+bool OpenBuyOrder(double lots)
+{
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double sl    = NormalizeDouble(price - (StopLossPips * _Point), _Digits);
+   double tp    = NormalizeDouble(price + (TakeProfitPips * _Point), _Digits);
+
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = _Symbol;
+   request.volume       = lots;
+   request.type         = ORDER_TYPE_BUY;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = 10;
+   request.comment      = CommentEA;
+   request.type_filling = ORDER_FILLING_FOK;
+   request.type_time    = ORDER_TIME_GTC;
+
+   if (!OrderSend(request, result))
+   {
+      Print("Buy OrderSend failed. Code=", GetLastError());
+      return false;
+   }
+
+   if (result.retcode == 10009)
+   {
+      Print("Buy Order Placed Successfully. Ticket=", result.order);
+      return true;
+   }
+   else
+   {
+      Print("Buy OrderSend retcode=", result.retcode);
+      return false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| دالة فتح صفقة بيع                                                |
+//+------------------------------------------------------------------+
+bool OpenSellOrder(double lots)
+{
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl    = NormalizeDouble(price + (StopLossPips * _Point), _Digits);
+   double tp    = NormalizeDouble(price - (TakeProfitPips * _Point), _Digits);
+
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = _Symbol;
+   request.volume       = lots;
+   request.type         = ORDER_TYPE_SELL;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = 10;
+   request.comment      = CommentEA;
+   request.type_filling = ORDER_FILLING_FOK;
+   request.type_time    = ORDER_TIME_GTC;
+
+   if (!OrderSend(request, result))
+   {
+      Print("Sell OrderSend failed. Code=", GetLastError());
+      return false;
+   }
+
+   if (result.retcode == 10009)
+   {
+      Print("Sell Order Placed Successfully. Ticket=", result.order);
+      return true;
+   }
+   else
+   {
+      Print("Sell OrderSend retcode=", result.retcode);
+      return false;
+   }
+}
