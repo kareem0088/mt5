@@ -1,0 +1,355 @@
+//+------------------------------------------------------------------+
+//|                                                     MyEA.mq5     |
+//|           استراتيجية الأوامر المعلقة وإدارة المخاطر مع           |
+//|                وقف الخسارة المتحرك المُحسن                        |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+// مدخلات الحساب والاستراتيجية
+input double   LotSize                   = 0.1;           // حجم اللوت الثابت
+input bool     UseCapitalBasedLotSizing  = true;          // تفعيل حساب حجم اللوت بناءً على الرصيد
+input double   LotPer100                 = 0.05;          // حجم اللوت لكل 100 دولار من الرصيد
+input int      MagicNumber               = 123456;        // رقم تعريف الصفقة
+
+// إعدادات التريلينج ستوب والسبريد
+input double   TrailingProfitThreshold   = 100;           // الحد الأدنى للأرباح (بالنقاط) لتفعيل التريلينج ستوب
+input double   TrailingStopOffset        = 10;            // المسافة (بالنقاط) التي يُبعد بها وقف الخسارة عن السعر الحالي عند التريلينج
+input double   MaxSpread                 = 130;           // أقصى سبريد مسموح
+input double   PendingActivationThreshold= 130;           // عتبة تفعيل الأمر المعلق
+input double   SpreadMultiplier          = 2.0;           // معامل ضرب السبريد في حساب وقف الخسارة (للأوامر المعلقة)
+
+// إعدادات الحساب
+input long     AllowedAccount            = 0;             // رقم الحساب المسموح (0 يعني جميع الحسابات)
+input string   ExpirationDateStr         = "2025.03.01 23:59:59";  // تاريخ انتهاء صلاحية الـ EA
+
+// إعدادات جلسات التداول
+// جلسة سيدني
+input bool     TradeSydney               = true;
+input int      SydneyStartHour           = 22;
+input int      SydneyStartMinute         = 0;
+input int      SydneyEndHour             = 7;
+input int      SydneyEndMinute           = 0;
+// جلسة طوكيو
+input bool     TradeTokyo                = true;
+input int      TokyoStartHour            = 0;
+input int      TokyoStartMinute          = 0;
+input int      TokyoEndHour              = 9;
+input int      TokyoEndMinute            = 0;
+// جلسة لندن
+input bool     TradeLondon               = true;
+input int      LondonStartHour           = 8;
+input int      LondonStartMinute         = 0;
+input int      LondonEndHour             = 17;
+input int      LondonEndMinute           = 0;
+// جلسة نيويورك
+input bool     TradeNewYork              = true;
+input int      NewYorkStartHour          = 13;
+input int      NewYorkStartMinute        = 0;
+input int      NewYorkEndHour            = 22;
+input int      NewYorkEndMinute          = 0;
+
+// المتغيرات العامة
+datetime       lastOrderCandleTime       = 0;             // وقت الشمعة التي تم عليها وضع الأمر المعلق
+long           pendingTicket             = -1;            // رقم تذكرة الأمر المعلق (-1 تعني عدم وجود أمر، -2 للإلغاء)
+
+//+------------------------------------------------------------------+
+//| دالة: CheckSession                                              |
+//| الهدف: التحقق مما إذا كان الوقت الحالي ضمن فترة جلسة معينة       |
+//+------------------------------------------------------------------+
+bool CheckSession(int startHour, int startMinute, int endHour, int endMinute)
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentMinutes = dt.hour * 60 + dt.min;
+   int startMinutes   = startHour * 60 + startMinute;
+   int endMinutes     = endHour * 60 + endMinute;
+   
+   if(startMinutes < endMinutes)
+      return (currentMinutes >= startMinutes && currentMinutes < endMinutes);
+   else // الجلسة تمتد عبر منتصف الليل
+      return (currentMinutes >= startMinutes || currentMinutes < endMinutes);
+}
+
+//+------------------------------------------------------------------+
+//| دالة: IsTradingTime                                             |
+//| الهدف: تحديد ما إذا كان الوقت الحالي ضمن إحدى جلسات التداول      |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   if(TradeSydney && CheckSession(SydneyStartHour, SydneyStartMinute, SydneyEndHour, SydneyEndMinute))
+      return true;
+   if(TradeTokyo && CheckSession(TokyoStartHour, TokyoStartMinute, TokyoEndHour, TokyoEndMinute))
+      return true;
+   if(TradeLondon && CheckSession(LondonStartHour, LondonStartMinute, LondonEndHour, LondonEndMinute))
+      return true;
+   if(TradeNewYork && CheckSession(NewYorkStartHour, NewYorkStartMinute, NewYorkEndHour, NewYorkEndMinute))
+      return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| دالة: OnInit                                                    |
+//| الهدف: التهيئة الأولية والتحقق من الحساب وتاريخ الانتهاء         |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // التحقق من الحساب المسموح
+   if(AllowedAccount != 0 && AccountInfoInteger(ACCOUNT_LOGIN) != AllowedAccount)
+   {
+      Print("الحساب الحالي غير مسموح لتشغيل هذا الـ EA.");
+      return(INIT_FAILED);
+   }
+   
+   // التحقق من تاريخ انتهاء الصلاحية
+   datetime expiration = StringToTime(ExpirationDateStr);
+   if(TimeCurrent() > expiration)
+   {
+      Print("انتهت صلاحية تشغيل الـ EA.");
+      return(INIT_FAILED);
+   }
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| دالة: PointsToPips                                              |
+//| الهدف: تحويل النقاط العشرية (pipettes) إلى نقاط كاملة (pips)     |
+//+------------------------------------------------------------------+
+double PointsToPips(double points)
+{
+   // ملاحظة: تأكد من الطريقة المناسبة حسب وسيطك؛ هنا نفترض أن 10 نقاط عشرية = 1 pip
+   return points / 10.0;
+}
+
+//+------------------------------------------------------------------+
+//| دالة: ErrorDescription                                          |
+//| الهدف: تحويل رمز الخطأ إلى وصف مقروء                            |
+//+------------------------------------------------------------------+
+string ErrorDescription(int errorCode)
+{
+   switch(errorCode)
+   {
+      case 0:     return "بدون خطأ";
+      case 1:     return "خطأ عام";
+      case 2:     return "مزود غير صحيح";
+      case 3:     return "رمز غير صحيح";
+      case 4:     return "تذكرة صفقة غير صحيحة";
+      case 5:     return "سعر غير صحيح";
+      case 6:     return "وقف خسارة غير صحيح";
+      default:    return "خطأ غير معروف";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| دالة: OnTick                                                    |
+//| الهدف: منطق التنفيذ الأساسي وإدارة الأوامر والتريلينج ستوب        |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // التأكد من أن الوقت الحالي ضمن جلسات التداول المسموح بها
+   if(!IsTradingTime())
+      return;
+      
+   // فحص وجود صفقة مفتوحة بنفس الـ MagicNumber والرمز
+   bool openPositionExists = false;
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      ulong posTicket = PositionGetTicket(i);
+      if(PositionSelectByTicket(posTicket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            StringCompare(PositionGetString(POSITION_SYMBOL), _Symbol) == 0)
+         {
+            openPositionExists = true;
+            break;
+         }
+      }
+   }
+   
+   // --- جزء وضع الأمر المعلق ---
+   // يتم وضع الأمر المعلق فقط إذا لم توجد صفقة مفتوحة حالياً
+   if(!openPositionExists)
+   {
+      // الحصول على بيانات الشمعة السابقة (index 1)
+      datetime prevCandleTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+      double prevOpen  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+      double prevClose = iClose(_Symbol, PERIOD_CURRENT, 1);
+      
+      // التأكد من أن الشمعة لم تُعالج من قبل
+      if(lastOrderCandleTime == prevCandleTime)
+         ; // لا نقوم بأي إجراء إضافي
+      else if(TimeCurrent() < prevCandleTime + 60) // الانتظار 60 ثانية بعد إغلاق الشمعة
+         ; // لم ينقضِ الوقت المطلوب بعد إغلاق الشمعة
+      else
+      {
+         // حذف أوامر معلقة من الشمعة السابقة إن وجدت
+         int totalOrders = OrdersTotal();
+         for(int i = totalOrders - 1; i >= 0; i--)
+         {
+            ulong order_ticket = OrderGetTicket(i);
+            if(OrderSelect(order_ticket))
+            {
+               if(OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
+                  StringCompare(OrderGetString(ORDER_SYMBOL), _Symbol) == 0)
+               {
+                  int order_type = (int)OrderGetInteger(ORDER_TYPE);
+                  if(order_type == ORDER_TYPE_BUY_STOP || order_type == ORDER_TYPE_SELL_STOP)
+                  {
+                     trade.OrderDelete(order_ticket);
+                  }
+               }
+            }
+         }
+         // إعادة تعيين متغير الأمر المعلق
+         pendingTicket = -1;
+         
+         // تحديد اتجاه الشمعة لتحديد نوع الأمر المعلق
+         int orderType = -1;
+         if(prevClose > prevOpen)
+            orderType = ORDER_TYPE_BUY_STOP;
+         else if(prevClose < prevOpen)
+            orderType = ORDER_TYPE_SELL_STOP;
+         else
+            orderType = -1;  // شمعة دوجي: لا إجراء
+         
+         if(orderType != -1)
+         {
+            // تحديد سعر تنفيذ الأمر مع تعديل بسيط (10 * _Point)
+            double price = 0.0;
+            if(orderType == ORDER_TYPE_BUY_STOP)
+               price = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + 10 * _Point;
+            else if(orderType == ORDER_TYPE_SELL_STOP)
+               price = SymbolInfoDouble(_Symbol, SYMBOL_BID) - 10 * _Point;
+            
+            // حساب السبريد الحالي بالنقاط (لأوامر الانتظار فقط)
+            double spreadPoints = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+            double slDistance   = spreadPoints * SpreadMultiplier * _Point;
+            
+            // حساب وقف الخسارة بالنسبة للأمر المعلق
+            double stopLoss = 0.0;
+            if(orderType == ORDER_TYPE_BUY_STOP)
+               stopLoss = price - slDistance;
+            else if(orderType == ORDER_TYPE_SELL_STOP)
+               stopLoss = price + slDistance;
+            
+            // حساب حجم اللوت بناءً على الرصيد أو الحجم الثابت مع تطبيعه وفقاً لمتطلبات الرمز
+            double computedVolume = UseCapitalBasedLotSizing ? (AccountInfoDouble(ACCOUNT_BALANCE) / 100.0) * LotPer100 : LotSize;
+            double volMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+            double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+            if(computedVolume < volMin)
+               computedVolume = volMin;
+            else
+               computedVolume = MathFloor(computedVolume / volStep) * volStep;
+            
+            // إعداد طلب وضع الأمر المعلق
+            MqlTradeRequest request;
+            MqlTradeResult  result;
+            ZeroMemory(request);
+            ZeroMemory(result);
+            
+            request.action         = TRADE_ACTION_PENDING;
+            request.symbol         = _Symbol;
+            request.volume         = computedVolume;
+            request.magic          = MagicNumber;
+            request.price          = price;
+            request.sl             = stopLoss;
+            request.tp             = 0;              // لا يوجد هدف ربح محدد
+            request.deviation      = 10;
+            request.type           = orderType;
+            request.type_filling   = ORDER_FILLING_FOK;
+            request.type_time      = ORDER_TIME_GTC;
+            
+            if(!trade.OrderSend(request, result))
+            {
+               Print("فشل إرسال الأمر المعلق: ", result.comment);
+            }
+            else
+            {
+               pendingTicket = (long)result.order;
+               lastOrderCandleTime = prevCandleTime;
+               
+               // فحص السبريد الحالي قبل تفعيل الأمر المعلق
+               double currentPrice = (orderType == ORDER_TYPE_BUY_STOP) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+               if(spreadPoints > MaxSpread && MathAbs(price - currentPrice) < PendingActivationThreshold * _Point)
+               {
+                  trade.OrderDelete((ulong)pendingTicket);
+                  pendingTicket = -2;
+                  Print("تم إلغاء الأمر المعلق بسبب ارتفاع السبريد.");
+               }
+            }
+         }
+      }
+   }
+   
+   // --- إدارة وقف الخسارة المتحرك للصفقات المفتوحة ---
+   totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      ulong posTicket = PositionGetTicket(i);
+      if(PositionSelectByTicket(posTicket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            StringCompare(PositionGetString(POSITION_SYMBOL), _Symbol)==0)
+         {
+            double posPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
+            double currentSL  = PositionGetDouble(POSITION_SL);
+            ulong ticket      = PositionGetInteger(POSITION_TICKET);
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            
+            // معالجة صفقة شراء
+            if(posType == POSITION_TYPE_BUY)
+            {
+               double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+               double profitPips = PointsToPips((currentBid - posPrice) / _Point); // تحويل الفرق إلى pips
+               if(profitPips >= TrailingProfitThreshold)
+               {
+                  double newSL = currentBid - (TrailingStopOffset * 10 * _Point); // 10 نقاط عشرية لكل pip
+                  newSL = NormalizeDouble(newSL, _Digits);
+                  newSL = MathMax(newSL, posPrice); // لا يقل عن سعر الدخول
+                  
+                  double minDistance = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+                  if((currentBid - newSL) < minDistance)
+                  {
+                     newSL = currentBid - minDistance;
+                     newSL = NormalizeDouble(newSL, _Digits);
+                  }
+                  
+                  if(newSL > currentSL || currentSL == 0)
+                  {
+                     if(!trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
+                        Print("خطأ في تعديل وقف الخسارة لشراء: ", IntegerToString(GetLastError()));
+                  }
+               }
+            }
+            // معالجة صفقة بيع
+            else if(posType == POSITION_TYPE_SELL)
+            {
+               double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+               double profitPips = PointsToPips((posPrice - currentAsk) / _Point); // تحويل الفرق إلى pips
+               if(profitPips >= TrailingProfitThreshold)
+               {
+                  double newSL = currentAsk + (TrailingStopOffset * 10 * _Point); // 10 نقاط عشرية لكل pip
+                  newSL = NormalizeDouble(newSL, _Digits);
+                  newSL = MathMin(newSL, posPrice); // لا يزيد عن سعر الدخول
+                  
+                  double minDistance = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+                  if((newSL - currentAsk) < minDistance)
+                  {
+                     newSL = currentAsk + minDistance;
+                     newSL = NormalizeDouble(newSL, _Digits);
+                  }
+                  
+                  if((newSL < currentSL || currentSL == 0) && newSL != 0)
+                  {
+                     if(!trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
+                        Print("خطأ في تعديل وقف الخسارة لبيع: ", IntegerToString(GetLastError()));
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
