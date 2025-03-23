@@ -1,0 +1,433 @@
+//+------------------------------------------------------------------+
+//| ENG-TALAL-V1.mq5                                                |
+//| إدارة جلسات، أوامر معلقة، SL/TP بلا تريلينج ستوب                 |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+
+//--- تضمين مكتبات التداول
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+// كائنات للتداول وللوصول للصفقات
+CTrade        trade;
+CPositionInfo m_position;
+
+//======================================================================
+//|         مدخلات تخص الجلسات والأوامر، لا يوجد أي تريلينج هنا       |
+//======================================================================
+
+// أحجام اللوت
+input double Lots = 0.01;
+input double TrailingStopActivationPoints = 200;
+input double TrailingStopDistancePoints = 100;
+
+// إعدادات جلسات (مثال London, NY, Tokyo, Sydney)
+input bool   TradeLondon     = true;
+input int    LondonStartHour = 8;
+input int    LondonStartMin  = 0;
+input int    LondonEndHour   = 16;
+input int    LondonEndMin    = 0;
+input color  LondonColor     = clrBlue;
+
+input bool   TradeNY         = true;
+input int    NYStartHour     = 13;
+input int    NYStartMin      = 0;
+input int    NYEndHour       = 22;
+input int    NYEndMin        = 0;
+input color  NYColor         = clrRed;
+
+input bool   TradeTokyo      = true;
+input int    TokyoStartHour  = 0;
+input int    TokyoStartMin   = 0;
+input int    TokyoEndHour    = 9;
+input int    TokyoEndMin     = 0;
+input color  TokyoColor      = clrGreen;
+
+input bool   TradeSydney     = true;
+input int    SydStartHour    = 22;
+input int    SydStartMin     = 0;
+input int    SydEndHour      = 7;
+input int    SydEndMin       = 0;
+input color  SydColor        = clrMagenta;
+
+// الإطار الزمني لشمعة البريك آوت (30 دقيقة مثلاً)
+input ENUM_TIMEFRAMES BreakoutTF = PERIOD_M30;
+
+//======================================================================
+//|     متغيرات للتأكد من فتح الأوامر مرة واحدة ومعرفة أعلى/أدنى سعر   |
+//======================================================================
+bool g_openedTrade_London  = false;
+bool g_openedTrade_NY      = false;
+bool g_openedTrade_Tokyo   = false;
+bool g_openedTrade_Sydney  = false;
+
+double g_sessHigh_London   = -DBL_MAX, g_sessLow_London   =  DBL_MAX;
+double g_sessHigh_NY       = -DBL_MAX, g_sessLow_NY       =  DBL_MAX;
+double g_sessHigh_Tokyo    = -DBL_MAX, g_sessLow_Tokyo    =  DBL_MAX;
+double g_sessHigh_Sydney   = -DBL_MAX, g_sessLow_Sydney   =  DBL_MAX;
+
+datetime g_sessTime_London = 0,
+         g_sessTime_NY     = 0,
+         g_sessTime_Tokyo  = 0,
+         g_sessTime_Sydney = 0;
+
+// تذاكر الأوامر المعلقة لكي نلغي واحدًا في حال تفعل الآخر
+ulong g_buyStopTicket  = 0;
+ulong g_sellStopTicket = 0;
+
+
+
+
+//--------------------------------------------------------------
+// تحديث وقف الخسارة المتحرك للصفقات الرئيسية
+//--------------------------------------------------------------
+void UpdateTrailingStop()
+  {
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+        {
+         Print("فشل اختيار الصفقة (UpdateTrailingStop): ", ticket);
+         continue;
+        }
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      int type = (int)PositionGetInteger(POSITION_TYPE);
+      double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+
+      if(type == POSITION_TYPE_BUY)
+        {
+         double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double profitPoints = (currentBid - entryPrice) / _Point;
+         if(profitPoints >= TrailingStopActivationPoints)
+           {
+            double newSL = currentBid - TrailingStopDistancePoints * _Point;
+            if(newSL > entryPrice && newSL > currentSL)
+              {
+               if(trade.PositionModify(ticket, newSL, 0))
+                  Print("تحديث وقف الخسارة (BUY): ", ticket, " وقف جديد: ", newSL);
+               else
+                  Print("فشل تحديث وقف الخسارة (BUY): ", ticket, " الخطأ: ", trade.ResultRetcodeDescription());
+              }
+           }
+        }
+      else
+         if(type == POSITION_TYPE_SELL)
+           {
+            double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double profitPoints = (entryPrice - currentAsk) / _Point;
+            if(profitPoints >= TrailingStopActivationPoints)
+              {
+               double newSL = currentAsk + TrailingStopDistancePoints * _Point;
+               if(newSL < entryPrice && (currentSL == 0 || newSL < currentSL))
+                 {
+                  if(trade.PositionModify(ticket, newSL, 0))
+                     Print("تحديث وقف الخسارة (SELL): ", ticket, " وقف جديد: ", newSL);
+                  else
+                     Print("فشل تحديث وقف الخسارة (SELL): ", ticket, " الخطأ: ", trade.ResultRetcodeDescription());
+                 }
+              }
+           }
+     }
+  }
+
+
+//======================================================================
+//| 1) دوال إدارة الجلسات وفتح الأوامر المعلقة (بلا تريلينج ستوب)     |
+//======================================================================
+void CheckSession(int startHour, int startMin, int endHour, int endMin,
+                  bool enableSession, string sessionName, color sessionColor,
+                  bool &openedTradeSession,
+                  double &sessionHigh, double &sessionLow,
+                  datetime &sessStartTime)
+{
+   if(!enableSession)
+      return;
+
+   datetime nowTime = TimeCurrent();
+   MqlDateTime tm;
+   TimeToStruct(nowTime, tm);
+
+   // تحديد بداية ونهاية الجلسة
+   datetime sessionStart = StructToTime(tm);
+   sessionStart -= (tm.hour*3600 + tm.min*60 + tm.sec);
+   sessionStart += (startHour*3600 + startMin*60);
+
+   datetime sessionEnd = StructToTime(tm);
+   sessionEnd -= (tm.hour*3600 + tm.min*60 + tm.sec);
+   sessionEnd += (endHour*3600 + endMin*60);
+
+   // في حال الجلسة تتخطى منتصف الليل
+   if(endHour < startHour)
+   {
+      if(nowTime < sessionStart)
+         sessionStart -= 24*3600;
+      sessionEnd += 24*3600;
+   }
+
+   // إذا نحن ضمن وقت الجلسة
+   if(nowTime >= sessionStart && nowTime < sessionEnd)
+   {
+      // إذا كانت الجلسة جديدة
+      if(sessStartTime == 0 || sessStartTime != sessionStart)
+      {
+         sessionHigh        = -DBL_MAX;
+         sessionLow         =  DBL_MAX;
+         openedTradeSession = false;
+         sessStartTime      = sessionStart;
+
+         // كائنات رسم في التشارت إن رغبت برسم مستطيل للجلسة
+         string rectName = sessionName + "_Rectangle";
+         if(ObjectFind(0, rectName) == -1)
+         {
+            ObjectCreate(0, rectName, OBJ_RECTANGLE, 0, nowTime, 0.0);
+            ObjectSetInteger(0, rectName, OBJPROP_COLOR, sessionColor);
+            ObjectSetInteger(0, rectName, OBJPROP_BACK, true);
+         }
+         // كائن نص للجلسة
+         string textName = sessionName + "_Text";
+         if(ObjectFind(0, textName) == -1)
+         {
+            ObjectCreate(0, textName, OBJ_TEXT, 0, sessionStart, 0.0);
+            ObjectSetInteger(0, textName, OBJPROP_COLOR, sessionColor);
+            ObjectSetInteger(0, textName, OBJPROP_FONTSIZE, 10);
+            ObjectSetInteger(0, textName, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+            ObjectSetString(0, textName, OBJPROP_TEXT, sessionName);
+         }
+      }
+
+      // تحدّث الهاي واللو
+      double midPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) * 0.5;
+      if(midPrice > sessionHigh) sessionHigh = midPrice;
+      if(midPrice < sessionLow)  sessionLow  = midPrice;
+
+      UpdateRectangle(sessionName, sessionStart, sessionEnd, sessionHigh, sessionLow);
+
+      // ضع أوامر معلقة بعد 30 دقيقة من بداية الجلسة
+      if(!openedTradeSession)
+      {
+         datetime firstCandleClose = sessionStart + (30*60); 
+         if(nowTime >= firstCandleClose)
+         {
+            double candleHigh, candleLow;
+            if(!GetCandleHighLow(_Symbol, BreakoutTF, firstCandleClose, candleHigh, candleLow))
+               return;
+
+            // مثال حسابي: SL و TP = نريد مسافة مساوية بين أمر الدخول و SL/TP
+            double buyStopPrice = candleHigh;
+            double buySL        = candleLow;
+            double distBuy      = MathAbs(buyStopPrice - buySL);
+            double buyTP        = buyStopPrice + distBuy; // مثلاً ريشيو 1:1
+
+            double sellStopPrice= candleLow;
+            double sellSL       = candleHigh;
+            double distSell     = MathAbs(sellStopPrice - sellSL);
+            double sellTP       = sellStopPrice - distSell; // ريشيو 1:1
+
+            bool canPlaceBuy  = (buyStopPrice > buySL && buyStopPrice < buyTP);
+            bool canPlaceSell = (sellStopPrice < sellSL && sellStopPrice > sellTP);
+
+            // أمر شراء
+            if(canPlaceBuy)
+               g_buyStopTicket  = PlacePendingOrder(ORDER_TYPE_BUY_STOP,  buyStopPrice,  buySL,  buyTP,  sessionName + "_BuyStop");
+            else
+               Print("[", sessionName, "] لم يتم وضع أمر شراء - تحقق من المسافات.");
+
+            // أمر بيع
+            if(canPlaceSell)
+               g_sellStopTicket = PlacePendingOrder(ORDER_TYPE_SELL_STOP, sellStopPrice, sellSL, sellTP, sessionName + "_SellStop");
+            else
+               Print("[", sessionName, "] لم يتم وضع أمر بيع - تحقق من المسافات.");
+
+            openedTradeSession = true;
+         }
+      }
+   }
+   else if(nowTime >= sessionEnd)
+   {
+      // تحديث الرسم بعد انتهاء الجلسة
+      UpdateRectangle(sessionName, sessionStart, sessionEnd, sessionHigh, sessionLow);
+   }
+}
+
+// دالة تحديث الرسم للمستطيل والنص في التشارت
+void UpdateRectangle(string sessionName, datetime sessStart, datetime sessEnd,
+                     double sessHigh, double sessLow)
+{
+   string rectName = sessionName + "_Rectangle";
+   if(ObjectFind(0, rectName) != -1)
+   {
+      ObjectSetInteger(0, rectName, OBJPROP_TIME,  0, sessStart);
+      ObjectSetDouble( 0, rectName, OBJPROP_PRICE, 0, sessLow);
+      ObjectSetInteger(0, rectName, OBJPROP_TIME,  1, sessEnd);
+      ObjectSetDouble( 0, rectName, OBJPROP_PRICE, 1, sessHigh);
+   }
+   string textName = sessionName + "_Text";
+   if(ObjectFind(0, textName) != -1)
+   {
+      double offset    = (sessHigh - sessLow) * 0.05;
+      double textPrice = sessLow - offset;
+      ObjectSetInteger(0, textName, OBJPROP_TIME,  0, sessStart);
+      ObjectSetDouble(0, textName, OBJPROP_PRICE, 0, textPrice);
+   }
+}
+
+
+//======================================================================
+//| 2) دوال خدمية: جلب هاي/لو لشمعة سابقة، وضع أوامر معلقة، إلغاء أمر |
+//======================================================================
+
+// جلب هاي ولو الشمعة التي أغلقت عند/قبل وقت معين
+bool GetCandleHighLow(string symbol, ENUM_TIMEFRAMES timeframe, datetime candleCloseTime,
+                      double &chigh, double &clow)
+{
+   int bars = iBars(symbol, timeframe);
+   if(bars < 2)
+      return false;
+
+   for(int i = 0; i < bars - 1; i++)
+   {
+      datetime cTime = iTime(symbol, timeframe, i);
+      if(cTime <= candleCloseTime)
+      {
+         chigh = iHigh(symbol, timeframe, i);
+         clow  = iLow(symbol, timeframe, i);
+         return true;
+      }
+   }
+   return false;
+}
+
+// وضع أمر معلق (شراء ستوب أو بيع ستوب) مع SL/TP
+ulong PlacePendingOrder(ENUM_ORDER_TYPE type, double price, double sl, double tp, string comment)
+{
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action    = TRADE_ACTION_PENDING;
+   request.symbol    = _Symbol;
+   request.volume    = Lots;
+   request.type      = type;
+   request.price     = NormalizeDouble(price, _Digits);
+   request.sl        = NormalizeDouble(sl,    _Digits);
+   request.tp        = NormalizeDouble(tp,    _Digits);
+   request.deviation = 10;
+   request.magic     = 12345;
+   request.comment   = comment;
+
+   if(!OrderSend(request, result) || result.retcode != TRADE_RETCODE_DONE)
+   {
+      Print("فشل وضع الامر المعلق ", comment, ", retcode=", result.retcode, ", السبب=", result.comment);
+      return 0;
+   }
+   Print("تم وضع أمر معلق: ", comment, ", تذكرة=", result.order);
+   return result.order;
+}
+
+// إذا تفعل أمر شراء، ألغِ أمر البيع، والعكس
+void CancelOppositeOrderIfOneIsTriggered()
+{
+   bool buyTriggered  = false;
+   bool sellTriggered = false;
+
+   int totalPositions = PositionsTotal();
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(!m_position.SelectByIndex(i))
+         continue;
+      if(m_position.Symbol() != _Symbol)
+         continue;
+      if(m_position.Magic()  != 12345)
+         continue;
+
+      long posType = m_position.PositionType();
+      if(posType == POSITION_TYPE_BUY)  buyTriggered  = true;
+      if(posType == POSITION_TYPE_SELL) sellTriggered = true;
+   }
+
+   // لو تفعل الشراء => ألغِ البيع المعلق
+   if(buyTriggered && g_sellStopTicket > 0)
+   {
+      CancelOrder(g_sellStopTicket);
+      g_sellStopTicket = 0;
+   }
+   // لو تفعل البيع => ألغِ الشراء المعلق
+   if(sellTriggered && g_buyStopTicket > 0)
+   {
+      CancelOrder(g_buyStopTicket);
+      g_buyStopTicket = 0;
+   }
+}
+
+// إلغاء أمر معلق
+bool CancelOrder(ulong ticket)
+{
+   if(!OrderSelect(ticket))
+      return false;
+
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action    = TRADE_ACTION_REMOVE;
+   request.order     = ticket;
+   request.symbol    = _Symbol;
+   request.deviation = 10;
+
+   if(!OrderSend(request, result) || result.retcode != TRADE_RETCODE_DONE)
+   {
+      Print("فشل إلغاء الأمر المعلق #", ticket, ", السبب=", result.comment);
+      return false;
+   }
+   Print("تم إلغاء الأمر المعلق #", ticket, " بنجاح.");
+   return true;
+}
+
+
+//======================================================================
+//|         الدوال الحدثية الأساسية: OnInit / OnDeinit / OnTick       |
+//======================================================================
+int OnInit()
+{
+   Print("");
+   return(INIT_SUCCEEDED);
+}
+//----------------------------------------------------------------------
+void OnDeinit(const int reason)
+{
+   Print("", reason);
+}
+//----------------------------------------------------------------------
+void OnTick()
+{
+
+UpdateTrailingStop();
+
+   // 1) إدارة الجلسات ووضع الأوامر لكل جلسة
+   CheckSession(LondonStartHour, LondonStartMin, LondonEndHour, LondonEndMin,
+                TradeLondon, "London", LondonColor,
+                g_openedTrade_London, g_sessHigh_London, g_sessLow_London, g_sessTime_London);
+
+   CheckSession(NYStartHour, NYStartMin, NYEndHour, NYEndMin,
+                TradeNY, "NewYork", NYColor,
+                g_openedTrade_NY, g_sessHigh_NY, g_sessLow_NY, g_sessTime_NY);
+
+   CheckSession(TokyoStartHour, TokyoStartMin, TokyoEndHour, TokyoEndMin,
+                TradeTokyo, "Tokyo", TokyoColor,
+                g_openedTrade_Tokyo, g_sessHigh_Tokyo, g_sessLow_Tokyo, g_sessTime_Tokyo);
+
+   CheckSession(SydStartHour, SydStartMin, SydEndHour, SydEndMin,
+                TradeSydney, "Sydney", SydColor,
+                g_openedTrade_Sydney, g_sessHigh_Sydney, g_sessLow_Sydney, g_sessTime_Sydney);
+
+   // 2) إذا تفعل أمر شراء أو بيع، نلغي الآخر المعاكس
+   CancelOppositeOrderIfOneIsTriggered();
+}
